@@ -1,0 +1,62 @@
+[
+  {
+    "id": "baidu-netdisk",
+    "name": "Baidu Netdisk",
+    "url": "https://pan.baidu.com/",
+    "enabled": true
+  },
+  {
+    "id": "youtube",
+    "name": "YouTube",
+    "url": "https://www.youtube.com/",
+    "enabled": true
+  },
+  {
+    "id": "google-ai-studio",
+    "name": "Google AI Studio",
+    "url": "https://aistudio.google.com/",
+    "enabled": true
+  },
+  {
+    "id": "doubao",
+    "name": "Doubao",
+    "url": "https://www.doubao.com/chat",
+    "enabled": true
+  },
+  {
+    "id": "workbuddy",
+    "name": "WorkBuddy",
+    "url": "https://www.workbuddy.cn/app",
+    "enabled": true
+  },
+  {
+    "id": "biorender",
+    "name": "BioRender",
+    "url": "https://app.biorender.com/",
+    "enabled": true
+  },
+  {
+    "id": "chatgpt-web",
+    "name": "ChatGPT Web",
+    "url": "https://chatgpt.com/",
+    "enabled": true
+  },
+  {
+    "id": "spotify",
+    "name": "Spotify",
+    "url": "https://open.spotify.com/",
+    "enabled": true
+  },
+  {
+    "id": "undermind",
+    "name": "Undermind",
+    "url": "https://app.undermind.ai/",
+    "enabled": true
+  },
+  {
+    "id": "pubmed",
+    "name": "PubMed",
+    "url": "https://pubmed.ncbi.nlm.nih.gov/",
+    "enabled": true
+  }
+]
