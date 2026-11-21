@@ -1,0 +1,255 @@
+name: Build Pake macOS Apps in Batch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 350
+    env:
+      NODE_VERSION: "22"
+      PNPM_VERSION: "10.26.2"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Pake build environment
+        uses: ./.github/actions/setup-env
+        with:
+          mode: build
+
+      - name: Build Pake CLI
+        run: pnpm run cli:build
+
+      - name: Build apps sequentially
+        id: batch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import shutil
+          import signal
+          import stat
+          import subprocess
+          import traceback
+          from contextlib import suppress
+          from pathlib import Path
+          from tempfile import mkdtemp
+          from unicodedata import normalize
+          from urllib.parse import urlsplit
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          batch_dir = Path(os.environ["RUNNER_TEMP"]) / "pake-macos-batch"
+          dmg_dir = batch_dir / "dmgs"
+          logs_dir = batch_dir / "logs"
+          dmg_dir.mkdir(parents=True)
+          logs_dir.mkdir()
+          timeout_seconds = 25 * 60
+
+          # Reuse Pake's Cargo build directory while giving each invocation an empty output directory.
+          build_env = os.environ.copy()
+          build_env["CARGO_TARGET_DIR"] = str(workspace / "src-tauri" / "target")
+          build_env.pop("PAKE_CREATE_APP", None)
+
+          class BuildFailure(Exception):
+              pass
+
+          def valid_url(url):
+              if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+                  return False
+              if re.search(r"[\s\x00-\x1f\x7f\\]", url):
+                  return False
+              try:
+                  parsed = urlsplit(url)
+                  parsed.port  # Validate the port if present.
+                  return bool(parsed.hostname) and parsed.username is None and parsed.password is None
+              except ValueError:
+                  return False
+
+          def reported_dmg(result, work):
+              outputs = result.get("outputs")
+              if not isinstance(outputs, list) or not all(isinstance(entry, dict) for entry in outputs):
+                  raise BuildFailure("Pake JSON has an invalid outputs array")
+              dmgs = [entry for entry in outputs if entry.get("format") == "dmg"]
+              if len(dmgs) != 1:
+                  raise BuildFailure(f"Expected one DMG in Pake JSON, found {len(dmgs)}")
+              path = dmgs[0].get("path")
+              if not isinstance(path, str) or not path.strip() or "\x00" in path:
+                  raise BuildFailure("Pake JSON has an invalid DMG path")
+              candidate = work / path
+              try:
+                  package = candidate.resolve(strict=True)
+              except FileNotFoundError as error:
+                  raise BuildFailure("Reported DMG does not exist") from error
+              if candidate.is_symlink() or not package.is_relative_to(work):
+                  raise BuildFailure("Reported DMG is a symlink or is outside the app output directory")
+              info = package.stat()
+              if package.suffix.lower() != ".dmg" or not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
+                  raise BuildFailure("Reported DMG must be a non-empty regular .dmg file")
+              return package
+
+          def build_app(app_id, name, url, log_path):
+              stdout_path = logs_dir / f"{app_id}.stdout.json"
+              work = Path(mkdtemp(dir=batch_dir)).resolve()
+              try:
+                  # Match the single-app options and request Pake's machine-readable result.
+                  args = [
+                      "node", str(workspace / "dist" / "cli.js"), url, "--name", name,
+                      "--width", "1200", "--height", "780", "--app-version", "1.0.0",
+                      "--new-window", "--multi-arch", "--json",
+                  ]
+                  with stdout_path.open("wb") as stdout, log_path.open("wb") as stderr:
+                      lock = Path(build_env["CARGO_TARGET_DIR"]) / ".pake-build.lock"
+                      try:
+                          with subprocess.Popen(
+                              args, cwd=work, env=build_env, stdin=subprocess.DEVNULL,
+                              stdout=stdout, stderr=stderr, start_new_session=True,
+                          ) as process:
+                              try:
+                                  status = process.wait(timeout=timeout_seconds)
+                              except subprocess.TimeoutExpired:
+                                  with suppress(ProcessLookupError):
+                                      os.killpg(process.pid, signal.SIGTERM)
+                                  with suppress(subprocess.TimeoutExpired):
+                                      process.wait(timeout=15)
+                                  with suppress(ProcessLookupError):
+                                      os.killpg(process.pid, signal.SIGKILL)
+                                  process.wait()
+                                  raise BuildFailure("Build exceeded 25 minutes")
+                      finally:
+                          # Leave Pake's lock intact. Later apps can reuse a fresh target if needed.
+                          if lock.exists():
+                              build_env["CARGO_TARGET_DIR"] = str(batch_dir / f"cargo-after-{app_id}")
+                  try:
+                      result = json.loads(stdout_path.read_text(encoding="utf-8"))
+                  except (ValueError, RecursionError) as error:
+                      raise BuildFailure(f"Pake stdout is not valid JSON (exit code {status})") from error
+                  if not isinstance(result, dict) or type(result.get("ok")) is not bool:
+                      raise BuildFailure(f"Pake JSON is missing a Boolean ok field (exit code {status})")
+                  if status != 0 or not result["ok"]:
+                      with log_path.open("a", encoding="utf-8") as log:
+                          print(f"\nPake JSON error: {json.dumps(result.get('error'), ensure_ascii=True)}", file=log)
+                      raise BuildFailure(f"Pake reported a failed build (exit code {status})")
+                  reported_dmg(result, work).replace(dmg_dir / f"{name}.dmg")
+              finally:
+                  shutil.rmtree(work, ignore_errors=True)
+
+          rows = []
+          used_ids = set()
+          used_names = set()
+          try:
+              apps = json.loads((workspace / "pake-apps.json").read_text(encoding="utf-8"))
+              if not isinstance(apps, list):
+                  raise ValueError("The config must contain a JSON array")
+          except (OSError, ValueError) as error:
+              rows.append(("pake-apps.json", "Failed", "Could not read a valid JSON array", "config-error.log"))
+              (logs_dir / "config-error.log").write_text(str(error), encoding="utf-8")
+              apps = []
+
+          for index, app in enumerate(apps, 1):
+              label = f"Config entry {index}"
+              if not isinstance(app, dict) or type(app.get("enabled")) is not bool:
+                  rows.append((label, "Failed", "Expected an object with a Boolean enabled field", ""))
+                  continue
+              # The config ID labels entries and diagnostics. Pake resolves the bundle identifier.
+              app_id, name, url = (app.get(key) for key in ("id", "name", "url"))
+              if not (
+                  isinstance(app_id, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", app_id)
+                  and isinstance(name, str) and name == name.strip()
+                  and re.fullmatch(r"[\w][\w .()+-]{0,79}", name)
+              ):
+                  rows.append((label, "Failed", "Invalid app ID or name", ""))
+                  continue
+              if not app["enabled"]:
+                  reason = "Disabled" if valid_url(url) else "Disabled; URL pending or invalid"
+                  rows.append((name, "Skipped", reason, ""))
+                  continue
+              if not valid_url(url):
+                  rows.append((name, "Failed", "Invalid or missing HTTP(S) URL; build skipped", ""))
+                  continue
+              name_key = normalize("NFC", name).casefold()
+              if app_id in used_ids or name_key in used_names:
+                  rows.append((name, "Failed", "Duplicate app ID or DMG filename; build skipped", ""))
+                  continue
+              used_ids.add(app_id)
+              used_names.add(name_key)
+              print(f"Building {name} ({app_id})", flush=True)
+              log_path = logs_dir / f"{app_id}.log"
+              try:
+                  build_app(app_id, name, url, log_path)
+              except Exception as error:
+                  reason = str(error) if isinstance(error, BuildFailure) else "Unexpected build error"
+                  detail = traceback.format_exc()
+                  try:
+                      with log_path.open("a", encoding="utf-8") as log:
+                          log.write(f"\nBatch build failure:\n{detail}")
+                  except OSError:
+                      for line in detail.splitlines():
+                          print(f"[{app_id}] {line}")
+                      rows.append((name, "Failed", f"{reason} (see job log)", ""))
+                  else:
+                      rows.append((name, "Failed", reason, log_path.name))
+              else:
+                  rows.append((name, "Built", f"`{name}.dmg`", log_path.name))
+
+          summary = ["## Pake macOS batch results"]
+          for status in ("Built", "Failed", "Skipped"):
+              entries = [(name, reason, log) for name, result, reason, log in rows if result == status]
+              summary.extend(["", f"### {status} ({len(entries)})"])
+              for name, reason, log in entries:
+                  log_note = f" (log: `{log}`)" if log else ""
+                  summary.append(f"- **{name}** — {reason}{log_note}")
+          report = "\n".join(summary) + "\n"
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as file:
+              print(f"has_dmgs={str(any(result == 'Built' for _, result, _, _ in rows)).lower()}", file=file)
+              print("has_report=true", file=file)
+          (logs_dir / "summary.md").write_text(report, encoding="utf-8")
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as file:
+              file.write(report)
+          raise SystemExit(1 if any(result == "Failed" for _, result, _, _ in rows) else 0)
+          PY
+
+      - name: Upload successful DMGs
+        id: upload_dmgs
+        if: ${{ !cancelled() && steps.batch.outputs.has_dmgs == 'true' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: pake-macos-apps
+          path: ${{ runner.temp }}/pake-macos-batch/dmgs/*.dmg
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload build logs and summary
+        if: ${{ !cancelled() && steps.batch.outputs.has_report == 'true' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: pake-macos-build-logs
+          path: ${{ runner.temp }}/pake-macos-batch/logs/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Report DMG upload status
+        if: ${{ !cancelled() && steps.batch.outputs.has_report == 'true' }}
+        shell: bash
+        env:
+          HAS_DMGS: ${{ steps.batch.outputs.has_dmgs }}
+          UPLOAD_OUTCOME: ${{ steps.upload_dmgs.outcome }}
+          ARTIFACT_URL: ${{ steps.upload_dmgs.outputs.artifact-url }}
+        run: |
+          if [[ "$UPLOAD_OUTCOME" == "success" ]]; then
+            printf '\n[Download pake-macos-apps](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$HAS_DMGS" == "true" ]]; then
+            printf '\nDMG upload failed. See the upload step for details.\n' >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '\nNo DMGs were generated.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
